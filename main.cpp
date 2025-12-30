@@ -219,6 +219,7 @@ int main() {
     char seedBuf[64] = "0";
     int radiusInput = 15000;
     int progressIdx = 0;
+    bool seedError = false;
 
     loadSettings(seedBuf, radiusInput, progressIdx);
     currentRxIndex = progressIdx;
@@ -241,7 +242,7 @@ int main() {
             ImGui::BeginDisabled();
         }
 
-        ImGui::InputText("Seed", seedBuf, 64);
+        ImGui::InputText("Seed", seedBuf, 64, ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsNoBlank);
 
         int radiusStep = 1;
         ImGuiIO& io = ImGui::GetIO();
@@ -288,10 +289,24 @@ int main() {
         if (!isSearching) {
             const char* btnLabel = (currentRxIndex > 0) ? "Resume Search" : "Start New Search";
             if (ImGui::Button(btnLabel, ImVec2(185, 40))) {
-                isSearching = true;
-                isPaused = false;
-                int64_t s = std::stoll(seedBuf);
-                std::thread(runSearchManager, s, radiusInput).detach();
+                try {
+                    // Prüfen, ob das Feld leer ist
+                    if (strlen(seedBuf) == 0) {
+                        seedError = true;
+                    } else {
+                        int64_t s = std::stoll(seedBuf); // Versuch der Umwandlung
+                        seedError = false;               // Alles okay
+                        isSearching = true;
+                        isPaused = false;
+                        std::thread(runSearchManager, s, radiusInput).detach();
+                    }
+                } catch (const std::exception& e) {
+                    // Falls stoll trotzdem scheitert (z.B. Zahl zu groß für long long)
+                    seedError = true;
+                }
+            }
+            if (seedError) {
+                ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Error: Invalid Seed! Please enter a number.");
             }
             ImGui::SameLine();
             if (ImGui::Button("Reset Progress", ImVec2(185, 40))) {

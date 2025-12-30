@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_C_STANDARD 11)
 
 if(MSVC)
+    # Statisches Linken der Runtime für Portabilität
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
@@ -23,6 +24,7 @@ set(IMGUI_SOURCES
         ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
+# GLFW Optionen
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
@@ -33,11 +35,18 @@ add_subdirectory(external/glfw)
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
 
-add_executable(Crossroadsfinder
-        main.cpp
-        ${CUBIOMES_SOURCES}
-        ${IMGUI_SOURCES}
-)
+# --- QUELLDATEIEN ZUSAMMENFÜHREN ---
+set(PROJECT_SOURCES main.cpp ${CUBIOMES_SOURCES} ${IMGUI_SOURCES})
+
+# Wenn wir auf Windows sind, fügen wir die Resource-Datei für das Icon hinzu
+if(WIN32)
+    # Stelle sicher, dass die Datei resources.rc im selben Ordner wie diese CMakeLists.txt liegt!
+    set(PROJECT_SOURCES ${PROJECT_SOURCES} resources.rc)
+endif()
+
+# --- EXECUTABLE ERSTELLEN ---
+# Hier nutzen wir jetzt die oben definierte Liste ${PROJECT_SOURCES}
+add_executable(Crossroadsfinder ${PROJECT_SOURCES})
 
 target_include_directories(Crossroadsfinder PRIVATE
         cubiomes
@@ -61,3 +70,6 @@ if(NOT MSVC)
 else()
     target_compile_options(Crossroadsfinder PRIVATE /O2 /Oi /Ot)
 endif()
+
+# Blendet die Konsole im Hintergrund auf Windows aus
+set_target_properties(Crossroadsfinder PROPERTIES WIN32_EXECUTABLE TRUE)
