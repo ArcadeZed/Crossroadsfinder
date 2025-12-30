@@ -30,17 +30,16 @@ struct ClusterResult {
     }
 };
 
-// --- Globale Variablen für Thread-Synchronisation ---
 std::atomic<long long> regionsProcessed(0);
 std::atomic<bool> isSearching(false);
 std::atomic<bool> isPaused(false);
-std::atomic<int> currentRxIndex(0); // Der dynamische Fortschritts-Zähler
+std::atomic<int> currentRxIndex(0);
 std::mutex mergeMutex;
 std::vector<ClusterResult> allResults;
 long long totalRegionsToProcess = 1;
 auto startTime = std::chrono::steady_clock::now();
-int threadsToUse = std::thread::hardware_concurrency(); // Standard: Alle
-bool lowPriorityMode = true; // Standard: Ein
+int threadsToUse = std::thread::hardware_concurrency();
+bool lowPriorityMode = true;
 std::atomic<long long> regionsAtSessionStart(0);
 
 /**
@@ -101,13 +100,11 @@ void loadResults() {
     }
 }
 
-// --- Logik-Funktionen (Unverändert, nur leicht angepasst) ---
 #ifdef _WIN32
 #include <windows.h>
 #endif
 void searchSector(int64_t seed, int mc_version, int radius) {
     if (lowPriorityMode) {
-        // Setzt den Thread auf "IDLE", sodass er nur CPU kriegt, wenn sonst niemand sie will
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
     Generator g;
@@ -123,12 +120,10 @@ void searchSector(int64_t seed, int mc_version, int radius) {
     int sideLen = (2 * radius) + 1;
 
     while (isSearching) {
-        // Pausen-Check
         while (isPaused && isSearching) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        // Dynamisch die nächste Spalte (rx) holen
         int jobIndex = currentRxIndex.fetch_add(1);
         if (lowPriorityMode) {
             std::this_thread::sleep_for(std::chrono::microseconds(100)); // 0.1 Millisekunden Pause
@@ -181,18 +176,16 @@ void searchSector(int64_t seed, int mc_version, int radius) {
     }
 }
 
-// Startet die Suche in einem Hintergrund-Thread-Pool
 void runSearchManager(int64_t seed, int radius) {
     int sideLen = (2 * radius) + 1;
     totalRegionsToProcess = (long long)sideLen * sideLen;
-    // regionsProcessed wird basierend auf dem geladenen currentRxIndex gesetzt
     regionsProcessed = (long long)currentRxIndex.load() * sideLen;
 
     regionsAtSessionStart = regionsProcessed.load();
 
     startTime = std::chrono::steady_clock::now();
 
-    unsigned int tc = (unsigned int)threadsToUse; // Nutze den Wert vom Slider
+    unsigned int tc = (unsigned int)threadsToUse;
     if (tc < 1) tc = 1;
 
     std::vector<std::thread> threads;
@@ -202,7 +195,6 @@ void runSearchManager(int64_t seed, int radius) {
 
     for (auto& t : threads) t.join();
 
-    // Duplikate entfernen (falls durch Resume entstanden) & Sortieren
     std::lock_guard<std::mutex> lock(mergeMutex);
     std::sort(allResults.begin(), allResults.end(), [](const ClusterResult& a, const ClusterResult& b) {
         if (a.distSq != b.distSq) return a.distSq < b.distSq;
@@ -249,10 +241,8 @@ int main() {
             ImGui::BeginDisabled();
         }
 
-        // Seed Eingabe
         ImGui::InputText("Seed", seedBuf, 64);
 
-        // Radius Eingabe mit Modifier-Logik
         int radiusStep = 1;
         ImGuiIO& io = ImGui::GetIO();
         if (io.KeyCtrl && io.KeyShift) radiusStep = 1000;
@@ -261,7 +251,6 @@ int main() {
 
         ImGui::InputInt("Radius", &radiusInput, radiusStep, 0);
         if (radiusInput < 1) radiusInput = 1;
-        // Infos
         long long sideLen = (2LL * radiusInput) + 1;
         ImGui::Text("Total Regions: %lld", sideLen * sideLen);
         ImGui::TextDisabled("(?) Shift=+10, Ctrl=+100, Ctrl+Shift=+1000");
@@ -286,7 +275,6 @@ int main() {
             ImGui::SetTooltip("Sorgt dafür, dass der PC flüssig bleibt,\nindem die Suche anderen Programmen den Vorrang lässt.");
         ImGui::EndDisabled();
 
-        // Kleiner Hinweis, warum es ausgegraut ist (optional)
         if (isSearching && !isPaused) {
             ImGui::TextDisabled("(Stop search to change CPU settings)");
         }
@@ -313,8 +301,8 @@ int main() {
                     std::lock_guard<std::mutex> lock(mergeMutex);
                     allResults.clear();
                 }
-                std::remove("results.dat");    // Datei löschen
-                std::remove("settings.cfg");   // Einstellungen löschen
+                std::remove("results.dat");
+                std::remove("settings.cfg");
             }
         } else {
             if (ImGui::Button(isPaused ? "RESUME" : "PAUSE", ImVec2(185, 40))) isPaused = !isPaused;
@@ -332,13 +320,10 @@ int main() {
             if (elapsed > 0 && isSearching && !isPaused) {
                 long long currentTotal = regionsProcessed.load();
 
-                // Wie viel haben wir NUR in dieser Sitzung geschafft?
                 long long processedInSession = currentTotal - regionsAtSessionStart.load();
 
-                // Speed basierend auf der aktuellen Sitzung
                 long long speed = processedInSession / elapsed;
 
-                // Wie viel fehlt uns noch insgesamt?
                 long long remainingTotal = (sideLen * sideLen) - currentTotal;
 
                 if (speed > 0) {
@@ -369,21 +354,16 @@ int main() {
             for (int i = 0; i < (int)allResults.size(); i++) {
                 ImGui::TableNextRow();
 
-                // Spalte 0: Distanz
                 ImGui::TableSetColumnIndex(0);
                 ImGui::Text("%d", (int)std::sqrt(allResults[i].distSq));
 
-                // Spalte 1: Teleport Befehl
                 ImGui::TableSetColumnIndex(1);
                 char cmd[128];
                 snprintf(cmd, 128, "/tp %d %d %d", allResults[i].centerX, allResults[i].centerY + 2, allResults[i].centerZ);
                 ImGui::Text("%s", cmd);
 
-                // Spalte 2: Copy Button
                 ImGui::TableSetColumnIndex(2);
 
-                // Wir erstellen einen eindeutigen Namen wie "Copy##0", "Copy##1", etc.
-                // Das ## sorgt dafür, dass der Nutzer nur "Copy" sieht.
                 char btnLabel[32];
                 snprintf(btnLabel, sizeof(btnLabel), "Copy##btn_%d", i);
 
@@ -395,7 +375,6 @@ int main() {
         }
         ImGui::End();
 
-        // Periodisches Speichern (Crash-Schutz)
         static auto lastS = std::chrono::steady_clock::now();
         if (isSearching && std::chrono::steady_clock::now() - lastS > std::chrono::seconds(5)) {
             saveSettings(seedBuf, radiusInput, currentRxIndex.load());
@@ -403,7 +382,6 @@ int main() {
             lastS = std::chrono::steady_clock::now();
         }
 
-        // Rendering
         ImGui::Render();
         int dw, dh; glfwGetFramebufferSize(window, &dw, &dh);
         glViewport(0, 0, dw, dh); glClearColor(0.1f, 0.1f, 0.12f, 1.0f); glClear(GL_COLOR_BUFFER_BIT);
