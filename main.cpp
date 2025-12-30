@@ -8,6 +8,13 @@
 #include <mutex>
 #include <algorithm>
 #include <cmath>
+#include <string>
+
+// Dear ImGui & GLFW
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+#include <GLFW/glfw3.h>
 
 extern "C" {
 #include "finders.h"
@@ -16,17 +23,19 @@ extern "C" {
 
 struct ClusterResult {
     int centerX, centerY, centerZ;
-    long long distSq; // Distance squared for faster sorting
+    long long distSq;
 };
 
-// Global progress tracking and results storage
+// --- Globale Daten für die Kommunikation zwischen Threads ---
 std::atomic<long long> regionsProcessed(0);
+std::atomic<bool> isSearching(false);
 std::mutex mergeMutex;
 std::vector<ClusterResult> allResults;
+long long totalRegionsToProcess = 1;
+auto startTime = std::chrono::steady_clock::now();
 
-/**
- * Worker function to search a specific sector of the world for Quad Fortresses.
- */
+// --- Logik-Funktionen (Unverändert, nur leicht angepasst) ---
+
 void searchSector(int64_t seed, int mc_version, int rxStart, int rxEnd, int radius) {
     Generator g;
     setupGenerator(&g, mc_version, 0);
@@ -34,69 +43,44 @@ void searchSector(int64_t seed, int mc_version, int rxStart, int rxEnd, int radi
 
     std::vector<ClusterResult> localResults;
     Piece pieces[1000];
-
-    // Small buffer for filtered crossings to avoid heavy heap allocation
     struct SimplePos { int x, y, z; };
     SimplePos crossings[128];
-
     long long localCounter = 0;
 
     for (int rx = rxStart; rx < rxEnd; rx++) {
         for (int rz = -radius; rz <= radius; rz++) {
-            // Update global atomic counter periodically
-            if (++localCounter >= 1024) {
+            if (++localCounter >= 512) {
                 regionsProcessed.fetch_add(localCounter, std::memory_order_relaxed);
                 localCounter = 0;
             }
 
             Pos pos;
-            // Get the theoretical structure position based on the grid
-            if (!getStructurePos(Fortress, mc_version, (uint64_t)seed, rx, rz, &pos))
-                continue;
+            if (!getStructurePos(Fortress, mc_version, (uint64_t)seed, rx, rz, &pos)) continue;
+            if (!isViableStructurePos(Fortress, &g, pos.x, pos.z, 0)) continue;
 
-            // In 1.16+, biomes decide if a Fortress or a Bastion spawns.
-            // isViableStructurePos checks if the biome allows a Fortress here.
-            if (!isViableStructurePos(Fortress, &g, pos.x, pos.z, 0))
-                continue;
-
-            // Generate the structure pieces
             int count = getFortressPieces(pieces, 1000, mc_version, (uint64_t)seed, pos.x >> 4, pos.z >> 4);
             if (count < 4) continue;
 
-            // --- OPTIMIZED QUAD SEARCH ---
-            // First, filter for bridge crossings to reduce the search space
             int crossCount = 0;
             for (int i = 0; i < count && crossCount < 128; i++) {
                 if (pieces[i].type == BRIDGE_CROSSING) {
                     crossings[crossCount++] = {pieces[i].pos.x, pieces[i].pos.y, pieces[i].pos.z};
                 }
             }
-
             if (crossCount < 4) continue;
 
-            // Search for a 19x19 square alignment of four crossings (a "Quad")
             for (int i = 0; i < crossCount; i++) {
                 bool hasRight = false, hasBottom = false, hasDiagonal = false;
-                int x = crossings[i].x;
-                int y = crossings[i].y;
-                int z = crossings[i].z;
-
+                int x = crossings[i].x, y = crossings[i].y, z = crossings[i].z;
                 for (int j = 0; j < crossCount; j++) {
                     if (crossings[j].y != y) continue;
-
-                    int dx = crossings[j].x - x;
-                    int dz = crossings[j].z - z;
-
-                    // Standard Fortress crossing offset is 19 blocks
+                    int dx = crossings[j].x - x, dz = crossings[j].z - z;
                     if (dx == 19 && dz == 0) hasRight = true;
                     else if (dx == 0 && dz == 19) hasBottom = true;
                     else if (dx == 19 && dz == 19) hasDiagonal = true;
-
                     if (hasRight && hasBottom && hasDiagonal) break;
                 }
-
                 if (hasRight && hasBottom && hasDiagonal) {
-                    // Center of the quad is roughly +9 blocks from the top-left crossing
                     localResults.push_back({x + 9, y, z + 9, (long long)x*x + (long long)z*z});
                     break;
                 }
@@ -104,46 +88,23 @@ void searchSector(int64_t seed, int mc_version, int rxStart, int rxEnd, int radi
         }
     }
     regionsProcessed.fetch_add(localCounter, std::memory_order_relaxed);
-
     if (!localResults.empty()) {
         std::lock_guard<std::mutex> lock(mergeMutex);
         allResults.insert(allResults.end(), localResults.begin(), localResults.end());
     }
 }
 
-/**
- * Formats seconds into a HH:MM:SS string
- */
-std::string formatTime(long long totalSeconds) {
-    long long h = totalSeconds / 3600;
-    long long m = (totalSeconds % 3600) / 60;
-    long long s = totalSeconds % 60;
-    char buffer[32];
-    snprintf(buffer, sizeof(buffer), "%02lld:%02lld:%02lld", h, m, s);
-    return std::string(buffer);
-}
-
-int main() {
-    int64_t seed;
-    int radius = 15000;
+// Startet die Suche in einem Hintergrund-Thread-Pool
+void runSearchManager(int64_t seed, int radius) {
     int mc_version = MC_1_21;
-
-    std::cout << "=== ULTIMATE QUAD FINDER 1.21 ===\n";
-    std::cout << "Enter world seed: ";
-    if (!(std::cin >> seed)) {
-        std::cerr << "Invalid seed input.\n";
-        return 1;
-    }
-
-    auto startTime = std::chrono::steady_clock::now();
-    unsigned int tc = std::thread::hardware_concurrency();
-    if (tc == 0) tc = 4; // Fallback
-
     long long rangeX = (2LL * radius) + 1;
-    long long total = rangeX * rangeX;
+    totalRegionsToProcess = rangeX * rangeX;
+    regionsProcessed = 0;
+    allResults.clear();
+    startTime = std::chrono::steady_clock::now();
 
-    std::cout << "Searching in radius: " << radius << " (approx. " << total << " regions)\n";
-    std::cout << "Using " << tc << " threads...\n\n";
+    unsigned int tc = std::thread::hardware_concurrency();
+    if (tc == 0) tc = 4;
 
     std::vector<std::thread> threads;
     for (unsigned int i = 0; i < tc; i++) {
@@ -152,48 +113,123 @@ int main() {
         threads.emplace_back(searchSector, seed, mc_version, startRx, endRx, radius);
     }
 
-    // Progress monitoring loop
-    while (regionsProcessed.load() < total) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        long long current = regionsProcessed.load();
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
-
-        if (elapsed <= 0) continue;
-
-        double pct = (current * 100.0) / total;
-        long long regPerSec = current / elapsed;
-        long long secondsLeft = (regPerSec > 0) ? (total - current) / regPerSec : 0;
-
-        std::cout << "\rProgress: " << std::fixed << std::setprecision(2) << pct << "% | "
-                  << "Speed: " << regPerSec << " reg/s | "
-                  << "ETA: " << formatTime(secondsLeft) << " | "
-                  << "Quads found: " << allResults.size() << "    " << std::flush;
-
-        if (current >= total) break;
-    }
-
     for (auto& t : threads) t.join();
 
-    // Sort results by distance to (0,0)
     std::sort(allResults.begin(), allResults.end(), [](const ClusterResult& a, const ClusterResult& b) {
         return a.distSq < b.distSq;
     });
 
-    // Write results to file
-    std::ofstream f("quads_found.txt");
-    f << "# Quad Crossroads for Seed: " << seed << " (MC 1.21)\n";
-    for (const auto& r : allResults) {
-        f << "QUAD | Dist: " << (int)std::sqrt(r.distSq)
-          << " | /tp " << r.centerX << " " << r.centerY + 2 << " " << r.centerZ << "\n";
+    isSearching = false; // Signal an die GUI: Fertig!
+}
+
+int main() {
+    // --- 1. GLFW Initialisierung ---
+    if (!glfwInit()) return 1;
+    GLFWwindow* window = glfwCreateWindow(1000, 700, "Ultimate Quad Finder 1.21", NULL, NULL);
+    if (!window) return 1;
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1); // V-Sync an
+
+    // --- 2. ImGui Initialisierung ---
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 130");
+
+    // UI State
+    char seedBuf[64] = "0";
+    int radiusInput = 15000;
+    float progress = 0.0f;
+
+    // --- 3. Hauptschleife ---
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        // --- Fenster 1: Steuerung ---
+        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(380, 220), ImGuiCond_Always);
+        ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+
+        ImGui::InputText("Seed", seedBuf, 64);
+        ImGui::SliderInt("Radius", &radiusInput, 1000, 30000);
+
+        if (ImGui::Button("Start Search", ImVec2(-1, 40)) && !isSearching) {
+            isSearching = true;
+            int64_t seed = std::stoll(seedBuf);
+            std::thread(runSearchManager, seed, radiusInput).detach();
+        }
+
+        if (isSearching) {
+            long long current = regionsProcessed.load();
+            progress = (float)current / (float)totalRegionsToProcess;
+            ImGui::ProgressBar(progress, ImVec2(-1, 0));
+
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
+            if (elapsed > 0) {
+                long long speed = current / elapsed;
+                ImGui::Text("Speed: %lld reg/s", speed);
+            }
+        } else {
+            ImGui::Text("Status: Waiting...");
+        }
+        ImGui::End();
+
+        // --- Fenster 2: Ergebnisse ---
+        ImGui::SetNextWindowPos(ImVec2(400, 10), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(580, 680), ImGuiCond_Always);
+        ImGui::Begin("Results Found", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+
+        if (ImGui::BeginTable("ResultTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+            ImGui::TableSetupColumn("Distance", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableSetupColumn("Coordinates (X, Y, Z)", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+            ImGui::TableHeadersRow();
+
+            std::lock_guard<std::mutex> lock(mergeMutex);
+            for (int i = 0; i < allResults.size(); i++) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("%d", (int)std::sqrt(allResults[i].distSq));
+
+                ImGui::TableSetColumnIndex(1);
+                char coordBuf[128];
+                snprintf(coordBuf, sizeof(coordBuf), "/tp %d %d %d", allResults[i].centerX, allResults[i].centerY + 2, allResults[i].centerZ);
+                ImGui::Text("%s", coordBuf);
+
+                ImGui::TableSetColumnIndex(2);
+                ImGui::PushID(i);
+                if (ImGui::SmallButton("Copy TP")) {
+                    ImGui::SetClipboardText(coordBuf);
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::End();
+
+        // Rendering
+        ImGui::Render();
+        int display_w, display_h;
+        glfwGetFramebufferSize(window, &display_w, &display_h);
+        glViewport(0, 0, display_w, display_h);
+        glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(window);
     }
-    f.close();
 
-    auto endTime = std::chrono::steady_clock::now();
-    auto totalElapsed = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
-
-    std::cout << "\n\nSearch finished! Total time: " << formatTime(totalElapsed) << "\n";
-    std::cout << "Results saved to quads_found.txt\n";
+    // Cleanup
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwDestroyWindow(window);
+    glfwTerminate();
 
     return 0;
 }
