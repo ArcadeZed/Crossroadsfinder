@@ -24,7 +24,24 @@ extern "C" {
 struct ClusterResult {
     int centerX, centerY, centerZ;
     long long distSq;
+
+    bool operator==(const ClusterResult& other) const {
+        return centerX == other.centerX && centerY == other.centerY && centerZ == other.centerZ;
+    }
 };
+
+// --- Globale Variablen für Thread-Synchronisation ---
+std::atomic<long long> regionsProcessed(0);
+std::atomic<bool> isSearching(false);
+std::atomic<bool> isPaused(false);
+std::atomic<int> currentRxIndex(0); // Der dynamische Fortschritts-Zähler
+std::mutex mergeMutex;
+std::vector<ClusterResult> allResults;
+long long totalRegionsToProcess = 1;
+auto startTime = std::chrono::steady_clock::now();
+int threadsToUse = std::thread::hardware_concurrency(); // Standard: Alle
+bool lowPriorityMode = true; // Standard: Ein
+std::atomic<long long> regionsAtSessionStart(0);
 
 /**
  * Formats seconds into a HH:MM:SS string
@@ -38,64 +55,90 @@ std::string formatTime(long long totalSeconds) {
     return std::string(buffer);
 }
 
-void saveSettings(const char* seed, int radius) {
+void saveSettings(const char* seed, int radius, int progressIndex) {
     std::ofstream f("settings.cfg");
     if (f.is_open()) {
-        f << seed << "\n";
-        f << radius << "\n";
+        f << seed << "\n" << radius << "\n" << progressIndex << "\n";
+        f << threadsToUse << "\n" << (lowPriorityMode ? 1 : 0) << "\n";
         f.close();
     }
 }
 
-void loadSettings(char* seedBuf, int& radius) {
+void loadSettings(char* seedBuf, int& radius, int& progressIndex) {
     std::ifstream f("settings.cfg");
     if (f.is_open()) {
         std::string line;
-        if (std::getline(f, line)) {
-            // Seed laden (max 63 Zeichen + Nullterminator)
-            strncpy(seedBuf, line.c_str(), 63);
-            seedBuf[63] = '\0';
-        }
-        if (std::getline(f, line)) {
-            // Radius laden
-            try {
-                radius = std::stoi(line);
-            } catch (...) {
-                radius = 15000; // Fallback bei Fehler
-            }
+        if (std::getline(f, line)) { strncpy(seedBuf, line.c_str(), 63); seedBuf[63] = '\0'; }
+        if (std::getline(f, line)) radius = std::stoi(line);
+        if (std::getline(f, line)) progressIndex = std::stoi(line);
+        if (std::getline(f, line)) threadsToUse = std::stoi(line);
+        if (std::getline(f, line)) lowPriorityMode = (std::stoi(line) == 1);
+        f.close();
+    }
+}
+
+void saveResults() {
+    std::lock_guard<std::mutex> lock(mergeMutex);
+    std::ofstream f("results.dat");
+    if (f.is_open()) {
+        for (const auto& r : allResults) {
+            f << r.centerX << " " << r.centerY << " " << r.centerZ << " " << r.distSq << "\n";
         }
         f.close();
     }
 }
 
-// --- Globale Daten für die Kommunikation zwischen Threads ---
-std::atomic<long long> regionsProcessed(0);
-std::atomic<bool> isSearching(false);
-std::mutex mergeMutex;
-std::vector<ClusterResult> allResults;
-long long totalRegionsToProcess = 1;
-auto startTime = std::chrono::steady_clock::now();
+void loadResults() {
+    std::ifstream f("results.dat");
+    if (f.is_open()) {
+        std::lock_guard<std::mutex> lock(mergeMutex);
+        allResults.clear();
+        ClusterResult r;
+        while (f >> r.centerX >> r.centerY >> r.centerZ >> r.distSq) {
+            allResults.push_back(r);
+        }
+        f.close();
+    }
+}
 
 // --- Logik-Funktionen (Unverändert, nur leicht angepasst) ---
-
-void searchSector(int64_t seed, int mc_version, int rxStart, int rxEnd, int radius) {
+#ifdef _WIN32
+#include <windows.h>
+#endif
+void searchSector(int64_t seed, int mc_version, int radius) {
+    if (lowPriorityMode) {
+        // Setzt den Thread auf "IDLE", sodass er nur CPU kriegt, wenn sonst niemand sie will
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
     Generator g;
     setupGenerator(&g, mc_version, 0);
     applySeed(&g, -1, (uint64_t)seed);
 
-    std::vector<ClusterResult> localResults;
     Piece pieces[1000];
     struct SimplePos { int x, y, z; };
     SimplePos crossings[128];
-    long long localCounter = 0;
 
-    for (int rx = rxStart; rx < rxEnd; rx++) {
+    int startRx = -radius;
+    int endRx = radius;
+    int sideLen = (2 * radius) + 1;
+
+    while (isSearching) {
+        // Pausen-Check
+        while (isPaused && isSearching) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        // Dynamisch die nächste Spalte (rx) holen
+        int jobIndex = currentRxIndex.fetch_add(1);
+        if (lowPriorityMode) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100)); // 0.1 Millisekunden Pause
+        }
+        int rx = startRx + jobIndex;
+
+        if (rx > endRx || !isSearching) break;
+
+        std::vector<ClusterResult> columnResults;
         for (int rz = -radius; rz <= radius; rz++) {
-            if (++localCounter >= 512) {
-                regionsProcessed.fetch_add(localCounter, std::memory_order_relaxed);
-                localCounter = 0;
-            }
-
             Pos pos;
             if (!getStructurePos(Fortress, mc_version, (uint64_t)seed, rx, rz, &pos)) continue;
             if (!isViableStructurePos(Fortress, &g, pos.x, pos.z, 0)) continue;
@@ -123,215 +166,254 @@ void searchSector(int64_t seed, int mc_version, int rxStart, int rxEnd, int radi
                     if (hasRight && hasBottom && hasDiagonal) break;
                 }
                 if (hasRight && hasBottom && hasDiagonal) {
-                    localResults.push_back({x + 9, y, z + 9, (long long)x*x + (long long)z*z});
+                    columnResults.push_back({x + 9, y, z + 9, (long long)x*x + (long long)z*z});
                     break;
                 }
             }
         }
-    }
-    regionsProcessed.fetch_add(localCounter, std::memory_order_relaxed);
-    if (!localResults.empty()) {
-        std::lock_guard<std::mutex> lock(mergeMutex);
-        allResults.insert(allResults.end(), localResults.begin(), localResults.end());
+
+        regionsProcessed.fetch_add(sideLen, std::memory_order_relaxed);
+
+        if (!columnResults.empty()) {
+            std::lock_guard<std::mutex> lock(mergeMutex);
+            allResults.insert(allResults.end(), columnResults.begin(), columnResults.end());
+        }
     }
 }
 
 // Startet die Suche in einem Hintergrund-Thread-Pool
 void runSearchManager(int64_t seed, int radius) {
-    int mc_version = MC_1_21;
-    long long rangeX = (2LL * radius) + 1;
-    totalRegionsToProcess = rangeX * rangeX;
-    regionsProcessed = 0;
-    allResults.clear();
+    int sideLen = (2 * radius) + 1;
+    totalRegionsToProcess = (long long)sideLen * sideLen;
+    // regionsProcessed wird basierend auf dem geladenen currentRxIndex gesetzt
+    regionsProcessed = (long long)currentRxIndex.load() * sideLen;
+
+    regionsAtSessionStart = regionsProcessed.load();
+
     startTime = std::chrono::steady_clock::now();
 
-    unsigned int tc = std::thread::hardware_concurrency();
-    if (tc == 0) tc = 4;
+    unsigned int tc = (unsigned int)threadsToUse; // Nutze den Wert vom Slider
+    if (tc < 1) tc = 1;
 
     std::vector<std::thread> threads;
     for (unsigned int i = 0; i < tc; i++) {
-        int startRx = -radius + (int)(i * rangeX / tc);
-        int endRx = -radius + (int)((i + 1) * rangeX / tc);
-        threads.emplace_back(searchSector, seed, mc_version, startRx, endRx, radius);
+        threads.emplace_back(searchSector, seed, MC_1_21, radius);
     }
 
     for (auto& t : threads) t.join();
 
+    // Duplikate entfernen (falls durch Resume entstanden) & Sortieren
+    std::lock_guard<std::mutex> lock(mergeMutex);
     std::sort(allResults.begin(), allResults.end(), [](const ClusterResult& a, const ClusterResult& b) {
-        return a.distSq < b.distSq;
+        if (a.distSq != b.distSq) return a.distSq < b.distSq;
+        return a.centerX < b.centerX;
     });
+    allResults.erase(std::unique(allResults.begin(), allResults.end()), allResults.end());
 
-    isSearching = false; // Signal an die GUI: Fertig!
+    isSearching = false;
 }
 
 int main() {
-    // --- 1. GLFW Initialisierung ---
     if (!glfwInit()) return 1;
-    GLFWwindow* window = glfwCreateWindow(1000, 700, "Ultimate Quad Finder 1.21", NULL, NULL);
-    if (!window) return 1;
+    GLFWwindow* window = glfwCreateWindow(1100, 750, "Ultimate Quad Finder 1.21", NULL, NULL);
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1); // V-Sync an
+    glfwSwapInterval(1);
 
-    // --- 2. ImGui Initialisierung ---
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
-    ImGui::StyleColorsDark();
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
 
-    // UI State
     char seedBuf[64] = "0";
     int radiusInput = 15000;
-    float progress = 0.0f;
+    int progressIdx = 0;
 
-    loadSettings(seedBuf, radiusInput);
+    loadSettings(seedBuf, radiusInput, progressIdx);
+    currentRxIndex = progressIdx;
+    loadResults();
 
-    // --- 3. Hauptschleife ---
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // --- Fenster 1: Steuerung ---
+        // 1. SETTINGS WINDOW
         ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(380, 280), ImGuiCond_Always); // Etwas höher für die Zusatzinfos
+        ImGui::SetNextWindowSize(ImVec2(400, 320), ImGuiCond_Always);
         ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+
+        bool disableInputs = isSearching || (currentRxIndex > 0);
+
+        if (disableInputs) {
+            ImGui::BeginDisabled();
+        }
 
         // Seed Eingabe
         ImGui::InputText("Seed", seedBuf, 64);
 
-        // --- Im Inneren der main-Schleife (während das Fenster gezeichnet wird) ---
-
-        // 1. Modifier-Logik für den Radius berechnen
+        // Radius Eingabe mit Modifier-Logik
         int radiusStep = 1;
         ImGuiIO& io = ImGui::GetIO();
+        if (io.KeyCtrl && io.KeyShift) radiusStep = 1000;
+        else if (io.KeyCtrl) radiusStep = 100;
+        else if (io.KeyShift) radiusStep = 10;
 
-        if (io.KeyCtrl && io.KeyShift) {
-            radiusStep = 1000;
-        } else if (io.KeyCtrl) {
-            radiusStep = 100;
-        } else if (io.KeyShift) {
-            radiusStep = 10;
-        }
-
-        // 2. Das Input-Feld mit dynamischem Step anzeigen
-        // Wir setzen step_fast auf 0, damit nur unser berechneter Step zählt
-        ImGui::InputInt("Radius (Regions)", &radiusInput, radiusStep, 0);
-
-        // Schutz vor unsinnigen Werten
+        ImGui::InputInt("Radius", &radiusInput, radiusStep, 0);
         if (radiusInput < 1) radiusInput = 1;
-
-        // Kleiner Hilfstext für den Nutzer (optional, aber sehr hilfreich)
+        // Infos
+        long long sideLen = (2LL * radiusInput) + 1;
+        ImGui::Text("Total Regions: %lld", sideLen * sideLen);
         ImGui::TextDisabled("(?) Shift=+10, Ctrl=+100, Ctrl+Shift=+1000");
 
-        // --- BERECHNUNGEN FÜR INFOS ---
-        // Eine Region in der 1.21 Nether-Struktur-Verteilung ist ca. 512x512 Blöcke groß (32x32 Chunks)
-        long long sideLengthRegions = (2LL * radiusInput) + 1;
-        long long totalRegions = sideLengthRegions * sideLengthRegions;
-        double totalBlocksSide = sideLengthRegions * 512.0;
-        double totalChunksSide = sideLengthRegions * 32.0;
-
-        ImGui::Separator();
-        ImGui::Text("Scan Area Info:");
-        ImGui::BulletText("Total Regions: %lld", totalRegions);
-        ImGui::BulletText("Area: %.0f x %.0f Blocks", totalBlocksSide, totalBlocksSide);
-        ImGui::BulletText("Chunks: %.0f x %.0f", totalChunksSide, totalChunksSide);
-        ImGui::Separator();
-
-        // Start Button
-        if (ImGui::Button("Start Search", ImVec2(-1, 40)) && !isSearching) {
-            isSearching = true;
-            saveSettings(seedBuf, radiusInput);
-            try {
-                int64_t seed = std::stoll(seedBuf);
-                std::thread(runSearchManager, seed, radiusInput).detach();
-            } catch (...) {
-                isSearching = false; // Falls Seed kein Long ist
+        if (disableInputs) {
+            ImGui::EndDisabled();
+            if (currentRxIndex > 0 && !isSearching) {
+                ImGui::TextColored(ImVec4(1, 0.5f, 0, 1), "Reset progress to change Seed/Radius!");
             }
         }
 
-        // --- FORTSCHRITT & ETA ---
-        if (isSearching) {
-            long long current = regionsProcessed.load();
-            long long total = totalRegionsToProcess; // Wird in runSearchManager gesetzt
-            progress = (total > 0) ? (float)current / (float)total : 0.0f;
 
-            ImGui::ProgressBar(progress, ImVec2(-1, 0));
+        ImGui::Separator();
+        ImGui::Text("Performance CPU:");
+        ImGui::BeginDisabled(isSearching);
+        int maxThreads = std::thread::hardware_concurrency();
+        if (threadsToUse < 1) threadsToUse = 1;
+        if (threadsToUse > maxThreads) threadsToUse = maxThreads;
+        ImGui::SliderInt("Threads", &threadsToUse, 1, maxThreads);
+        ImGui::Checkbox("Background Mode (Low Priority)", &lowPriorityMode);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Sorgt dafür, dass der PC flüssig bleibt,\nindem die Suche anderen Programmen den Vorrang lässt.");
+        ImGui::EndDisabled();
+
+        // Kleiner Hinweis, warum es ausgegraut ist (optional)
+        if (isSearching && !isPaused) {
+            ImGui::TextDisabled("(Stop search to change CPU settings)");
+        }
+
+        ImGui::Separator();
+
+
+        ImGui::Separator();
+
+        // Buttons
+        if (!isSearching) {
+            const char* btnLabel = (currentRxIndex > 0) ? "Resume Search" : "Start New Search";
+            if (ImGui::Button(btnLabel, ImVec2(185, 40))) {
+                isSearching = true;
+                isPaused = false;
+                int64_t s = std::stoll(seedBuf);
+                std::thread(runSearchManager, s, radiusInput).detach();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reset Progress", ImVec2(185, 40))) {
+                currentRxIndex = 0;
+                regionsProcessed = 0;
+                {
+                    std::lock_guard<std::mutex> lock(mergeMutex);
+                    allResults.clear();
+                }
+                std::remove("results.dat");    // Datei löschen
+                std::remove("settings.cfg");   // Einstellungen löschen
+            }
+        } else {
+            if (ImGui::Button(isPaused ? "RESUME" : "PAUSE", ImVec2(185, 40))) isPaused = !isPaused;
+            ImGui::SameLine();
+            if (ImGui::Button("STOP & SAVE", ImVec2(185, 40))) isSearching = false;
+        }
+
+        // Progress & ETA
+        if (isSearching || currentRxIndex > 0) {
+            float prog = (float)currentRxIndex.load() / (float)sideLen;
+            ImGui::ProgressBar(prog, ImVec2(-1, 0));
 
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
+            if (elapsed > 0 && isSearching && !isPaused) {
+                long long currentTotal = regionsProcessed.load();
 
-            if (elapsed > 0 && current > 1000) {
-                long long speed = current / elapsed;
-                long long remaining = total - current;
-                long long secondsLeft = (speed > 0) ? (remaining / speed) : 0;
+                // Wie viel haben wir NUR in dieser Sitzung geschafft?
+                long long processedInSession = currentTotal - regionsAtSessionStart.load();
 
-                ImGui::Text("Speed: %lld reg/s", speed);
-                ImGui::SameLine(ImGui::GetWindowWidth() - 120);
-                ImGui::Text("ETA: %s", formatTime(secondsLeft).c_str());
-            } else {
-                ImGui::Text("Calculating speed...");
+                // Speed basierend auf der aktuellen Sitzung
+                long long speed = processedInSession / elapsed;
+
+                // Wie viel fehlt uns noch insgesamt?
+                long long remainingTotal = (sideLen * sideLen) - currentTotal;
+
+                if (speed > 0) {
+                    if (elapsed > 5 && processedInSession > 5000) {
+                        long long secondsLeft = remainingTotal / speed;
+                        ImGui::Text("Speed: %lld reg/s | ETA: %s", speed, formatTime(secondsLeft).c_str());
+                    } else {
+                        ImGui::Text("Calculating ETA...");
+                    }
+                } else {
+                    ImGui::Text("Speed: %lld reg/s | ETA: --:--:--", speed);
+                }
             }
-        } else {
-            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Status: Ready to scan");
         }
-
         ImGui::End();
 
-        // --- Fenster 2: Ergebnisse ---
-        ImGui::SetNextWindowPos(ImVec2(400, 10), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(580, 680), ImGuiCond_Always);
+        // 2. RESULTS WINDOW
+        ImGui::SetNextWindowPos(ImVec2(420, 10), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(660, 730), ImGuiCond_Always);
         ImGui::Begin("Results Found", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
-
-        if (ImGui::BeginTable("ResultTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
-            ImGui::TableSetupColumn("Distance", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-            ImGui::TableSetupColumn("Coordinates (X, Y, Z)", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        if (ImGui::BeginTable("ResTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+            ImGui::TableSetupColumn("Dist", 0, 80);
+            ImGui::TableSetupColumn("Teleport Command", 0, 400);
+            ImGui::TableSetupColumn("Copy", 0, 80);
             ImGui::TableHeadersRow();
 
             std::lock_guard<std::mutex> lock(mergeMutex);
-            for (int i = 0; i < allResults.size(); i++) {
+            for (int i = 0; i < (int)allResults.size(); i++) {
                 ImGui::TableNextRow();
+
+                // Spalte 0: Distanz
                 ImGui::TableSetColumnIndex(0);
                 ImGui::Text("%d", (int)std::sqrt(allResults[i].distSq));
 
+                // Spalte 1: Teleport Befehl
                 ImGui::TableSetColumnIndex(1);
-                char coordBuf[128];
-                snprintf(coordBuf, sizeof(coordBuf), "/tp %d %d %d", allResults[i].centerX, allResults[i].centerY + 2, allResults[i].centerZ);
-                ImGui::Text("%s", coordBuf);
+                char cmd[128];
+                snprintf(cmd, 128, "/tp %d %d %d", allResults[i].centerX, allResults[i].centerY + 2, allResults[i].centerZ);
+                ImGui::Text("%s", cmd);
 
+                // Spalte 2: Copy Button
                 ImGui::TableSetColumnIndex(2);
-                ImGui::PushID(i);
-                if (ImGui::SmallButton("Copy TP")) {
-                    ImGui::SetClipboardText(coordBuf);
+
+                // Wir erstellen einen eindeutigen Namen wie "Copy##0", "Copy##1", etc.
+                // Das ## sorgt dafür, dass der Nutzer nur "Copy" sieht.
+                char btnLabel[32];
+                snprintf(btnLabel, sizeof(btnLabel), "Copy##btn_%d", i);
+
+                if (ImGui::SmallButton(btnLabel)) {
+                    ImGui::SetClipboardText(cmd);
                 }
-                ImGui::PopID();
             }
             ImGui::EndTable();
         }
         ImGui::End();
 
+        // Periodisches Speichern (Crash-Schutz)
+        static auto lastS = std::chrono::steady_clock::now();
+        if (isSearching && std::chrono::steady_clock::now() - lastS > std::chrono::seconds(5)) {
+            saveSettings(seedBuf, radiusInput, currentRxIndex.load());
+            saveResults();
+            lastS = std::chrono::steady_clock::now();
+        }
+
         // Rendering
         ImGui::Render();
-        int display_w, display_h;
-        glfwGetFramebufferSize(window, &display_w, &display_h);
-        glViewport(0, 0, display_w, display_h);
-        glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        int dw, dh; glfwGetFramebufferSize(window, &dw, &dh);
+        glViewport(0, 0, dw, dh); glClearColor(0.1f, 0.1f, 0.12f, 1.0f); glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
     }
 
-    saveSettings(seedBuf, radiusInput);
-
-    // Cleanup
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplGlfw_Shutdown();
-    ImGui::DestroyContext();
-    glfwDestroyWindow(window);
-    glfwTerminate();
-
+    saveSettings(seedBuf, radiusInput, currentRxIndex.load());
+    saveResults();
+    ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplGlfw_Shutdown(); ImGui::DestroyContext();
+    glfwDestroyWindow(window); glfwTerminate();
     return 0;
 }
