@@ -66,8 +66,14 @@ if(UNIX)
 endif()
 
 if(NOT MSVC)
+    # Optimierungen für GCC/MinGW
     target_compile_options(Crossroadsfinder PRIVATE -O3 -march=native -ffast-math -funroll-loops)
+
+    # --- DIESE ZEILE IST NEU UND WICHTIG FÜR MINGW ---
+    # Sie baut die benötigten DLLs direkt in die EXE ein
+    target_link_options(Crossroadsfinder PRIVATE -static-libgcc -static-libstdc++ -static)
 else()
+    # Optimierungen für MSVC (Visual Studio)
     target_compile_options(Crossroadsfinder PRIVATE /O2 /Oi /Ot)
 endif()
 
