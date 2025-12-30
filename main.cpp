@@ -26,6 +26,48 @@ struct ClusterResult {
     long long distSq;
 };
 
+/**
+ * Formats seconds into a HH:MM:SS string
+ */
+std::string formatTime(long long totalSeconds) {
+    long long h = totalSeconds / 3600;
+    long long m = (totalSeconds % 3600) / 60;
+    long long s = totalSeconds % 60;
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%02lld:%02lld:%02lld", h, m, s);
+    return std::string(buffer);
+}
+
+void saveSettings(const char* seed, int radius) {
+    std::ofstream f("settings.cfg");
+    if (f.is_open()) {
+        f << seed << "\n";
+        f << radius << "\n";
+        f.close();
+    }
+}
+
+void loadSettings(char* seedBuf, int& radius) {
+    std::ifstream f("settings.cfg");
+    if (f.is_open()) {
+        std::string line;
+        if (std::getline(f, line)) {
+            // Seed laden (max 63 Zeichen + Nullterminator)
+            strncpy(seedBuf, line.c_str(), 63);
+            seedBuf[63] = '\0';
+        }
+        if (std::getline(f, line)) {
+            // Radius laden
+            try {
+                radius = std::stoi(line);
+            } catch (...) {
+                radius = 15000; // Fallback bei Fehler
+            }
+        }
+        f.close();
+    }
+}
+
 // --- Globale Daten für die Kommunikation zwischen Threads ---
 std::atomic<long long> regionsProcessed(0);
 std::atomic<bool> isSearching(false);
@@ -143,6 +185,8 @@ int main() {
     int radiusInput = 15000;
     float progress = 0.0f;
 
+    loadSettings(seedBuf, radiusInput);
+
     // --- 3. Hauptschleife ---
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -152,32 +196,88 @@ int main() {
 
         // --- Fenster 1: Steuerung ---
         ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(380, 220), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(380, 280), ImGuiCond_Always); // Etwas höher für die Zusatzinfos
         ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
+        // Seed Eingabe
         ImGui::InputText("Seed", seedBuf, 64);
-        ImGui::SliderInt("Radius", &radiusInput, 1000, 30000);
 
-        if (ImGui::Button("Start Search", ImVec2(-1, 40)) && !isSearching) {
-            isSearching = true;
-            int64_t seed = std::stoll(seedBuf);
-            std::thread(runSearchManager, seed, radiusInput).detach();
+        // --- Im Inneren der main-Schleife (während das Fenster gezeichnet wird) ---
+
+        // 1. Modifier-Logik für den Radius berechnen
+        int radiusStep = 1;
+        ImGuiIO& io = ImGui::GetIO();
+
+        if (io.KeyCtrl && io.KeyShift) {
+            radiusStep = 1000;
+        } else if (io.KeyCtrl) {
+            radiusStep = 100;
+        } else if (io.KeyShift) {
+            radiusStep = 10;
         }
 
+        // 2. Das Input-Feld mit dynamischem Step anzeigen
+        // Wir setzen step_fast auf 0, damit nur unser berechneter Step zählt
+        ImGui::InputInt("Radius (Regions)", &radiusInput, radiusStep, 0);
+
+        // Schutz vor unsinnigen Werten
+        if (radiusInput < 1) radiusInput = 1;
+
+        // Kleiner Hilfstext für den Nutzer (optional, aber sehr hilfreich)
+        ImGui::TextDisabled("(?) Shift=+10, Ctrl=+100, Ctrl+Shift=+1000");
+
+        // --- BERECHNUNGEN FÜR INFOS ---
+        // Eine Region in der 1.21 Nether-Struktur-Verteilung ist ca. 512x512 Blöcke groß (32x32 Chunks)
+        long long sideLengthRegions = (2LL * radiusInput) + 1;
+        long long totalRegions = sideLengthRegions * sideLengthRegions;
+        double totalBlocksSide = sideLengthRegions * 512.0;
+        double totalChunksSide = sideLengthRegions * 32.0;
+
+        ImGui::Separator();
+        ImGui::Text("Scan Area Info:");
+        ImGui::BulletText("Total Regions: %lld", totalRegions);
+        ImGui::BulletText("Area: %.0f x %.0f Blocks", totalBlocksSide, totalBlocksSide);
+        ImGui::BulletText("Chunks: %.0f x %.0f", totalChunksSide, totalChunksSide);
+        ImGui::Separator();
+
+        // Start Button
+        if (ImGui::Button("Start Search", ImVec2(-1, 40)) && !isSearching) {
+            isSearching = true;
+            saveSettings(seedBuf, radiusInput);
+            try {
+                int64_t seed = std::stoll(seedBuf);
+                std::thread(runSearchManager, seed, radiusInput).detach();
+            } catch (...) {
+                isSearching = false; // Falls Seed kein Long ist
+            }
+        }
+
+        // --- FORTSCHRITT & ETA ---
         if (isSearching) {
             long long current = regionsProcessed.load();
-            progress = (float)current / (float)totalRegionsToProcess;
+            long long total = totalRegionsToProcess; // Wird in runSearchManager gesetzt
+            progress = (total > 0) ? (float)current / (float)total : 0.0f;
+
             ImGui::ProgressBar(progress, ImVec2(-1, 0));
 
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
-            if (elapsed > 0) {
+
+            if (elapsed > 0 && current > 1000) {
                 long long speed = current / elapsed;
+                long long remaining = total - current;
+                long long secondsLeft = (speed > 0) ? (remaining / speed) : 0;
+
                 ImGui::Text("Speed: %lld reg/s", speed);
+                ImGui::SameLine(ImGui::GetWindowWidth() - 120);
+                ImGui::Text("ETA: %s", formatTime(secondsLeft).c_str());
+            } else {
+                ImGui::Text("Calculating speed...");
             }
         } else {
-            ImGui::Text("Status: Waiting...");
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Status: Ready to scan");
         }
+
         ImGui::End();
 
         // --- Fenster 2: Ergebnisse ---
@@ -223,6 +323,8 @@ int main() {
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
     }
+
+    saveSettings(seedBuf, radiusInput);
 
     // Cleanup
     ImGui_ImplOpenGL3_Shutdown();
